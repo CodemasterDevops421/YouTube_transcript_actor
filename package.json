@@ -1,0 +1,13 @@
+{
+  "name": "youtube-transcript-actor",
+  "version": "0.1.0",
+  "description": "Extract clean YouTube transcripts without official APIs",
+  "type": "module",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "node src/main.js"
+  },
+  "dependencies": {
+    "apify": "^3.2.0"
+  }
+}

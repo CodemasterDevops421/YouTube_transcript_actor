@@ -1,0 +1,9 @@
+{
+  "actorSpecification": 1,
+  "name": "youtube-transcript-actor",
+  "version": "0.1.0",
+  "buildTag": "latest",
+  "environmentVariables": {
+    "APIFY_LOG_LEVEL": "INFO"
+  }
+}
