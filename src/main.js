@@ -430,6 +430,7 @@ try {
                     await cacheStore.setValue(`yt:${videoId}:${usedLanguage}`, output);
                 }
 
+                await cleanTempDir(tempDir);
                 await Actor.pushData(output);
                 await Actor.exit();
             } catch (err) {
@@ -444,9 +445,9 @@ try {
             }
         }
     }
-} finally {
-    await cleanTempDir(tempDir);
 }
+
+await cleanTempDir(tempDir);
 
 const errorOutput = {
     status: blockedReason ? 'BLOCKED' : 'NO_TRANSCRIPT',
