@@ -31,7 +31,8 @@ export function decodeHtmlEntities(text) {
         .replace(/&gt;/g, '>')
         .replace(/&quot;/g, '"')
         .replace(/&#39;/g, "'")
-        .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+        // Use fromCodePoint to correctly handle emoji and code points > U+FFFF
+        .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(parseInt(n, 10)))
         .replace(/\u2028/g, ' ')
         .replace(/\u2029/g, ' ');
 }
@@ -65,6 +66,9 @@ export function parseVtt(vttContent, { removeBrackets = true } = {}) {
     let current = [];
     let startSec = null;
     let endSec = null;
+    // A blank line between cues means the next non-timing line is a cue identifier
+    // (optional label like "1" or "intro") that must be skipped, not treated as text.
+    let skipNextTextLine = true;
 
     const flush = () => {
         if (!current.length) return;
@@ -85,12 +89,21 @@ export function parseVtt(vttContent, { removeBrackets = true } = {}) {
 
     for (const line of lines) {
         const l = line.trim();
-        if (!l || l.startsWith('WEBVTT') || l.startsWith('Kind:') || l.startsWith('Language:')) continue;
+        if (!l || l.startsWith('WEBVTT') || l.startsWith('Kind:') || l.startsWith('Language:')) {
+            if (!l) skipNextTextLine = true; // blank line separates cues
+            continue;
+        }
         if (l.includes('-->')) {
             flush();
             const [start, end] = l.split('-->').map((s) => s.trim());
             startSec = parseTimestamp(start);
             endSec = parseTimestamp(end);
+            skipNextTextLine = false; // lines after timing are real cue text
+            continue;
+        }
+        if (skipNextTextLine) {
+            // This line is a cue identifier (e.g. "1", "2", "intro") — discard it
+            skipNextTextLine = false;
             continue;
         }
         current.push(l);
@@ -120,8 +133,11 @@ export function normalizeBlockedReason(stderr = '') {
     const s = stderr.toLowerCase();
     if (s.includes('429') || s.includes('too many requests')) return '429';
     if (s.includes('captcha')) return 'captcha';
-    if (s.includes('sign in to confirm') || s.includes('sign in')) return 'signin_required';
+    // Check specific phrase before generic "sign in" to avoid false positives
+    if (s.includes('sign in to confirm')) return 'signin_required';
     if (s.includes('consent') && s.includes('loop')) return 'consent_loop';
+    // Generic sign-in check last — broad but less likely to false-positive after above
+    if (s.includes('sign in')) return 'signin_required';
     return 'unknown';
 }
 
@@ -146,4 +162,24 @@ export function extractAvailableLanguages(listSubsOutput) {
         if (m) langs.add(m[1]);
     }
     return [...langs];
+}
+
+/**
+ * Parses the tab-delimited stdout from:
+ *   yt-dlp --print '%(title)s\t%(channel)s\t%(duration)s\t%(upload_date)s'
+ */
+export function parseMetadataLine(stdout) {
+    const [title, channel, duration, uploadDate] = (stdout || '').trim().split('\t');
+    const clean = (v) => (v && v !== 'NA' && v !== 'none' && v !== 'None') ? v.trim() : null;
+    const rawDate = clean(uploadDate);
+    // Convert YYYYMMDD → YYYY-MM-DD for consistency
+    const formattedDate = rawDate?.match(/^\d{8}$/)
+        ? `${rawDate.slice(0, 4)}-${rawDate.slice(4, 6)}-${rawDate.slice(6, 8)}`
+        : rawDate;
+    return {
+        title: clean(title),
+        channelName: clean(channel),
+        durationSec: duration && !Number.isNaN(Number(duration)) ? Number(duration) : null,
+        uploadDate: formattedDate ?? null,
+    };
 }

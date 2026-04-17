@@ -4,6 +4,7 @@ import {
     cleanSegmentText,
     normalizePreferredLanguage,
     normalizeBlockedReason,
+    parseMetadataLine,
 } from '../../src/utils.js';
 
 describe('decodeHtmlEntities', () => {
@@ -29,6 +30,11 @@ describe('decodeHtmlEntities', () => {
 
     test('decodes numeric entity &#9829; to heart symbol', () => {
         expect(decodeHtmlEntities('&#9829;')).toBe('♥');
+    });
+
+    test('correctly decodes emoji using high code point (requires fromCodePoint, not fromCharCode)', () => {
+        // U+1F600 is the grinning face emoji — above the BMP (> 0xFFFF)
+        expect(decodeHtmlEntities('&#128512;')).toBe('😀');
     });
 
     test('replaces Unicode line separator U+2028 with space', () => {
@@ -201,5 +207,55 @@ describe('normalizeBlockedReason', () => {
 
     test('matching is case-insensitive', () => {
         expect(normalizeBlockedReason('HTTP 429 ERROR')).toBe('429');
+    });
+});
+
+describe('parseMetadataLine', () => {
+    test('parses all four fields from a tab-delimited line', () => {
+        const result = parseMetadataLine('My Title\tMy Channel\t305\t20231015');
+        expect(result).toEqual({
+            title: 'My Title',
+            channelName: 'My Channel',
+            durationSec: 305,
+            uploadDate: '2023-10-15',
+        });
+    });
+
+    test('converts YYYYMMDD upload date to YYYY-MM-DD', () => {
+        expect(parseMetadataLine('T\tC\t60\t20200101').uploadDate).toBe('2020-01-01');
+    });
+
+    test('returns null for yt-dlp "NA" field values', () => {
+        const result = parseMetadataLine('NA\tNA\tNA\tNA');
+        expect(result.title).toBeNull();
+        expect(result.channelName).toBeNull();
+        expect(result.durationSec).toBeNull();
+        expect(result.uploadDate).toBeNull();
+    });
+
+    test('returns null durationSec for non-numeric duration', () => {
+        expect(parseMetadataLine('T\tC\tnot-a-number\t20231015').durationSec).toBeNull();
+    });
+
+    test('handles fractional duration (float seconds)', () => {
+        expect(parseMetadataLine('T\tC\t90.5\t20231015').durationSec).toBeCloseTo(90.5);
+    });
+
+    test('returns nulls for empty input', () => {
+        const result = parseMetadataLine('');
+        expect(result.title).toBeNull();
+        expect(result.channelName).toBeNull();
+        expect(result.durationSec).toBeNull();
+        expect(result.uploadDate).toBeNull();
+    });
+
+    test('trims whitespace from title and channel fields', () => {
+        const result = parseMetadataLine('  My Title  \t  My Channel  \t120\t20231015');
+        expect(result.title).toBe('My Title');
+        expect(result.channelName).toBe('My Channel');
+    });
+
+    test('handles upload date that is not 8 digits (leaves as-is)', () => {
+        expect(parseMetadataLine('T\tC\t60\t2023-10-15').uploadDate).toBe('2023-10-15');
     });
 });

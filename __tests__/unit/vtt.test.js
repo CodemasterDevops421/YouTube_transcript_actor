@@ -106,6 +106,38 @@ This is a test
         const segs = parseVtt(vtt);
         expect(segs[0].durSec).toBe(0);
     });
+
+    test('skips numeric cue identifier lines before timing lines', () => {
+        const vtt = 'WEBVTT\n\n1\n00:00:01.000 --> 00:00:04.000\nHello world\n';
+        const segs = parseVtt(vtt);
+        expect(segs).toHaveLength(1);
+        expect(segs[0].text).toBe('Hello world');
+    });
+
+    test('skips cue identifiers in multi-cue VTT without garbling text', () => {
+        const vtt = [
+            'WEBVTT',
+            '',
+            '1',
+            '00:00:01.000 --> 00:00:04.000',
+            'Hello',
+            '',
+            '2',
+            '00:00:05.000 --> 00:00:08.000',
+            'World',
+        ].join('\n');
+        const segs = parseVtt(vtt);
+        expect(segs).toHaveLength(2);
+        expect(segs[0].text).toBe('Hello');
+        expect(segs[1].text).toBe('World');
+    });
+
+    test('skips non-numeric cue identifiers (e.g. "intro") before timing lines', () => {
+        const vtt = 'WEBVTT\n\nintro\n00:00:01.000 --> 00:00:04.000\nHello world\n';
+        const segs = parseVtt(vtt);
+        expect(segs).toHaveLength(1);
+        expect(segs[0].text).toBe('Hello world');
+    });
 });
 
 describe('dedupeSegments', () => {
@@ -118,7 +150,7 @@ describe('dedupeSegments', () => {
         expect(dedupeSegments(segs)).toHaveLength(2);
     });
 
-    test('keeps the first occurrence of duplicate text, not subsequent ones', () => {
+    test('keeps the first occurrence of duplicate text', () => {
         const segs = [
             { text: 'Hello', startSec: 0 },
             { text: 'World', startSec: 1 },
@@ -140,9 +172,8 @@ describe('dedupeSegments', () => {
 
     test('skips segments with empty text', () => {
         const segs = [{ text: '' }, { text: 'Hello' }];
-        const result = dedupeSegments(segs);
-        expect(result).toHaveLength(1);
-        expect(result[0].text).toBe('Hello');
+        expect(dedupeSegments(segs)).toHaveLength(1);
+        expect(dedupeSegments(segs)[0].text).toBe('Hello');
     });
 
     test('skips segments with null text', () => {
