@@ -6,8 +6,14 @@
     "videoUrl": {
       "title": "YouTube video URL",
       "type": "string",
-      "description": "Supports watch?v=, youtu.be/, shorts/",
+      "description": "Single video URL. Supports watch?v=, youtu.be/, shorts/",
       "editor": "textfield"
+    },
+    "videoUrls": {
+      "title": "YouTube video URLs (batch)",
+      "type": "array",
+      "description": "Process multiple videos in one run. Takes priority over videoUrl if both are provided.",
+      "editor": "stringList"
     },
     "preferredLanguage": {
       "title": "Preferred transcript languages (ordered)",
