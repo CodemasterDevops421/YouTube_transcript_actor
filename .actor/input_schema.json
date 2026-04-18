@@ -54,24 +54,25 @@
       "type": "boolean",
       "default": false
     },
-    "enableWhisper": {
-      "title": "Enable Whisper fallback (disabled by default)",
-      "type": "boolean",
-      "default": false
-    },
     "maxRetries": {
       "title": "Max retries",
       "type": "integer",
-      "default": 2
+      "default": 2,
+      "minimum": 0,
+      "maximum": 10
     },
     "timeoutMs": {
       "title": "Total timeout (ms)",
       "type": "integer",
-      "default": 180000
+      "default": 180000,
+      "minimum": 1000,
+      "maximum": 300000000
     },
     "timeoutSecs": {
       "title": "Total timeout (seconds, optional)",
-      "type": "integer"
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 300000
     }
   },
   "required": ["videoUrl"]
