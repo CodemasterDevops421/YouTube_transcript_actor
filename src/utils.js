@@ -31,8 +31,8 @@ export function decodeHtmlEntities(text) {
         .replace(/&gt;/g, '>')
         .replace(/&quot;/g, '"')
         .replace(/&#39;/g, "'")
-        // Use fromCodePoint to correctly handle emoji and code points > U+FFFF
-        .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(parseInt(n, 10)))
+        // Use fromCodePoint for emoji/high Unicode; guard against out-of-range values
+        .replace(/&#(\d+);/g, (_, n) => { const cp = parseInt(n, 10); return cp <= 0x10FFFF ? String.fromCodePoint(cp) : ''; })
         .replace(/\u2028/g, ' ')
         .replace(/\u2029/g, ' ');
 }
@@ -56,7 +56,7 @@ export function cleanSegmentText(text, { removeBrackets = true } = {}) {
 export function parseTimestamp(ts) {
     const m = ts.match(/(\d+):(\d+):(\d+(?:\.\d+)?)/);
     if (!m) return null;
-    const [_, h, min, sec] = m;
+    const [, h, min, sec] = m;
     return Number(h) * 3600 + Number(min) * 60 + Number(sec);
 }
 

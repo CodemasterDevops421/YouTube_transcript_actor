@@ -1,0 +1,5 @@
+node_modules
+coverage
+.git
+__tests__
+INPUT.json

@@ -57,7 +57,9 @@
       "title": "Max retries per proxy mode",
       "type": "integer",
       "description": "Number of attempts per proxy tier before giving up or switching to the next tier.",
-      "default": 2
+      "default": 2,
+      "minimum": 1,
+      "maximum": 10
     },
     "timeoutMs": {
       "title": "Per-request timeout (ms)",

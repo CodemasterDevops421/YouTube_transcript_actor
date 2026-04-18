@@ -37,6 +37,10 @@ describe('decodeHtmlEntities', () => {
         expect(decodeHtmlEntities('&#128512;')).toBe('😀');
     });
 
+    test('returns empty string for out-of-range numeric entity (> U+10FFFF)', () => {
+        expect(decodeHtmlEntities('&#9999999;')).toBe('');
+    });
+
     test('replaces Unicode line separator U+2028 with space', () => {
         expect(decodeHtmlEntities('\u2028')).toBe(' ');
     });
