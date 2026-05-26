@@ -531,7 +531,7 @@ planLoop: for (const { strat, pm } of plan) {
 
     for (let attempt = 0; attempt < Math.max(1, maxRetries); attempt++) {
         try {
-            await Actor.sleep(Math.floor(300 + Math.random() * 700));
+            await new Promise(r => setTimeout(r, Math.floor(300 + Math.random() * 700)));
 
             const result = strat === 'direct'
                 ? await runDirectStrategy(videoId, { languagePrefs, proxyUrl, timeoutMs, removeBrackets, debug })
@@ -597,8 +597,8 @@ planLoop: for (const { strat, pm } of plan) {
             const msg = String(err?.message ?? err);
             if (debug) log.info(`[${strat}/${pm}/attempt ${attempt + 1}] ${msg}`);
 
-            if (msg.startsWith('BLOCKED:')) {
-                blockedReason = msg.split(':')[1];
+            if (msg.startsWith('BLOCKED:') || msg === 'HTTP_403' || msg === 'HTTP_429') {
+                blockedReason = msg.startsWith('BLOCKED:') ? msg.split(':')[1] : msg.replace('HTTP_', '');
                 lastError = msg;
                 break; // try next proxy mode
             }
