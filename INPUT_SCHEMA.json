@@ -9,14 +9,21 @@
       "description": "Supports watch?v=, youtu.be/, shorts/",
       "editor": "textfield"
     },
+    "strategy": {
+      "title": "Extraction strategy",
+      "type": "string",
+      "enum": ["auto", "direct", "ytdlp"],
+      "default": "auto",
+      "description": "auto: tries direct HTTP fetch first (fastest, no subprocess), falls back to yt-dlp. direct: direct only. ytdlp: yt-dlp only (most compatible)."
+    },
     "preferredLanguage": {
       "title": "Preferred transcript languages (ordered)",
       "type": "array",
-      "description": "Example: [\"en\", \"en-US\"]",
+      "description": "Example: [\"en\", \"en-US\"]. Defaults to English if omitted.",
       "editor": "stringList"
     },
     "languagePreference": {
-      "title": "Preferred transcript languages (legacy)",
+      "title": "Preferred transcript languages (legacy alias)",
       "type": "array",
       "description": "Legacy alias for preferredLanguage",
       "editor": "stringList"
@@ -32,11 +39,37 @@
       "enum": ["space", "newline"],
       "default": "space"
     },
+    "paragraphMode": {
+      "title": "Paragraph mode",
+      "type": "boolean",
+      "default": false,
+      "description": "Groups segments into paragraphs based on silence gaps. Outputs double-newline between paragraphs."
+    },
+    "paragraphBreakSecs": {
+      "title": "Paragraph break threshold (seconds)",
+      "type": "number",
+      "default": 1.5,
+      "description": "Minimum silence gap that triggers a new paragraph when paragraphMode is true."
+    },
     "outputMode": {
       "title": "Output mode",
       "type": "string",
       "enum": ["text_only", "text_and_segments"],
-      "default": "text_only"
+      "default": "text_only",
+      "description": "text_and_segments also includes the segments array with per-cue timing."
+    },
+    "outputFormat": {
+      "title": "Output format",
+      "type": "string",
+      "enum": ["text", "srt"],
+      "default": "text",
+      "description": "srt: also adds srtContent field with numbered subtitle blocks and timestamps."
+    },
+    "includeStats": {
+      "title": "Include transcript statistics",
+      "type": "boolean",
+      "default": false,
+      "description": "Adds stats object: wordCount, charCount, segmentCount, coveredSec, wordsPerMinute, estimatedReadingTimeSec."
     },
     "proxyMode": {
       "title": "Proxy mode",
@@ -50,17 +83,17 @@
       "default": false
     },
     "saveVttToKV": {
-      "title": "Save VTT to Key-Value Store",
+      "title": "Save raw VTT to Key-Value Store",
       "type": "boolean",
       "default": false
     },
     "enableWhisper": {
-      "title": "Enable Whisper fallback (disabled by default)",
+      "title": "Enable Whisper fallback (currently disabled)",
       "type": "boolean",
       "default": false
     },
     "maxRetries": {
-      "title": "Max retries",
+      "title": "Max retries per strategy/proxy combination",
       "type": "integer",
       "default": 2
     },
@@ -70,7 +103,7 @@
       "default": 180000
     },
     "timeoutSecs": {
-      "title": "Total timeout (seconds, optional)",
+      "title": "Total timeout (seconds, optional alias)",
       "type": "integer"
     }
   },

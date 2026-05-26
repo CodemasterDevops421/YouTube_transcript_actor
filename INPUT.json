@@ -1,7 +1,12 @@
 {
   "videoUrl": "https://www.youtube.com/watch?v=BV4ab2l0Re4",
-  "proxyMode": "datacenter",
+  "strategy": "auto",
+  "preferredLanguage": ["en"],
+  "proxyMode": "off",
   "outputMode": "text_only",
+  "outputFormat": "text",
+  "paragraphMode": false,
+  "includeStats": true,
   "saveVttToKV": false,
-  "preferredLanguage": "en"
+  "debug": true
 }

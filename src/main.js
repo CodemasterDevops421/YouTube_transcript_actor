@@ -7,13 +7,15 @@ import os from 'node:os';
 
 const execFileAsync = promisify(execFile);
 
+// ─── URL Utilities ────────────────────────────────────────────────────────────
+
 const YT_HOSTS = new Set(['www.youtube.com', 'youtube.com', 'youtu.be', 'm.youtube.com']);
 
-function extractVideoId(url) {
+function extractVideoId(rawUrl) {
     try {
-        const u = new URL(url);
+        const u = new URL(rawUrl);
         if (!YT_HOSTS.has(u.hostname)) return null;
-        if (u.hostname === 'youtu.be') return u.pathname.replace('/', '').slice(0, 11) || null;
+        if (u.hostname === 'youtu.be') return u.pathname.slice(1, 12) || null;
         if (u.pathname.startsWith('/shorts/')) return u.pathname.split('/')[2]?.slice(0, 11) || null;
         if (u.pathname === '/watch') return u.searchParams.get('v')?.slice(0, 11) || null;
         return null;
@@ -22,7 +24,7 @@ function extractVideoId(url) {
     }
 }
 
-function canonicalWatchUrl(videoId) {
+function makeWatchUrl(videoId) {
     return `https://www.youtube.com/watch?v=${videoId}`;
 }
 
@@ -33,6 +35,8 @@ function normalizePreferredLanguage(input) {
     return [];
 }
 
+// ─── VTT Parsing ─────────────────────────────────────────────────────────────
+
 function decodeHtmlEntities(text) {
     return text
         .replace(/&amp;/g, '&')
@@ -40,9 +44,8 @@ function decodeHtmlEntities(text) {
         .replace(/&gt;/g, '>')
         .replace(/&quot;/g, '"')
         .replace(/&#39;/g, "'")
-        .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
-        .replace(/\u2028/g, ' ')
-        .replace(/\u2029/g, ' ');
+        .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+        .replace(/[\u2028\u2029]/g, ' ');
 }
 
 function normalizeText(text) {
@@ -53,86 +56,272 @@ function normalizeText(text) {
         .trim();
 }
 
-function cleanSegmentText(text, { removeBrackets = true }) {
-    let t = String(text || '').trim();
+function cleanSegmentText(raw, { removeBrackets }) {
+    let t = decodeHtmlEntities(String(raw || '').replace(/<[^>]+>/g, ' ')).trim();
     if (removeBrackets) t = t.replace(/\[[^\]]+\]/g, '').trim();
-    // Remove ALL-CAPS speaker labels like "SPEAKER:" or "JOHN DOE:"
-    t = t.replace(/^([A-Z][A-Z0-9 ]{2,}):\s+/, '');
+    t = t.replace(/^[A-Z][A-Z0-9 ]{2,}:\s+/, '');
     return normalizeText(t);
 }
 
 function parseTimestamp(ts) {
     const m = ts.match(/(\d+):(\d+):(\d+(?:\.\d+)?)/);
     if (!m) return null;
-    const [_, h, min, sec] = m;
-    return Number(h) * 3600 + Number(min) * 60 + Number(sec);
+    return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
 }
 
-function parseVtt(vttContent, { removeBrackets = true }) {
+function parseVtt(vttContent, { removeBrackets }) {
     const lines = vttContent.split(/\r?\n/);
     const segments = [];
-    let current = [];
-    let startSec = null;
-    let endSec = null;
+    let textLines = [], startSec = null, endSec = null;
 
     const flush = () => {
-        if (!current.length) return;
-        const raw = current.join(' ');
-        const decoded = decodeHtmlEntities(raw.replace(/<[^>]*>/g, ' '));
-        const cleaned = cleanSegmentText(decoded, { removeBrackets });
-        if (cleaned) {
-            segments.push({
-                startSec,
-                durSec: startSec != null && endSec != null ? Math.max(0, endSec - startSec) : null,
-                text: cleaned,
-            });
-        }
-        current = [];
-        startSec = null;
-        endSec = null;
+        if (!textLines.length) return;
+        const text = cleanSegmentText(textLines.join(' '), { removeBrackets });
+        if (text) segments.push({
+            startSec,
+            durSec: startSec != null && endSec != null ? Math.max(0, endSec - startSec) : null,
+            text,
+        });
+        textLines = []; startSec = null; endSec = null;
     };
 
-    for (const line of lines) {
-        const l = line.trim();
-        if (!l || l.startsWith('WEBVTT') || l.startsWith('Kind:') || l.startsWith('Language:')) continue;
+    for (const raw of lines) {
+        const l = raw.trim();
+        if (!l || /^(WEBVTT|Kind:|Language:|NOTE\b)/.test(l)) continue;
         if (l.includes('-->')) {
             flush();
-            const [start, end] = l.split('-->').map((s) => s.trim());
-            startSec = parseTimestamp(start);
-            endSec = parseTimestamp(end);
-            continue;
+            const [s, e] = l.split('-->').map(p => p.trim().split(/\s/)[0]);
+            startSec = parseTimestamp(s);
+            endSec = parseTimestamp(e);
+        } else {
+            textLines.push(l);
         }
-        current.push(l);
     }
     flush();
     return segments;
 }
 
-function dedupeSegments(segments) {
-    const seen = new Set();
-    const out = [];
-    for (const s of segments) {
-        if (!s.text) continue;
-        if (seen.has(s.text)) continue;
-        seen.add(s.text);
-        out.push(s);
+// ─── Smart Deduplication ─────────────────────────────────────────────────────
+// YouTube auto-captions use a sliding window — each cue overlaps the next.
+// Detect prefix overlap >= 50% and merge into full sentences.
+
+function dedupeSegments(segments, isAutoGenerated) {
+    if (!segments.length) return segments;
+
+    if (isAutoGenerated) {
+        const merged = [];
+        for (const seg of segments) {
+            if (!seg.text) continue;
+            const prev = merged[merged.length - 1];
+            if (prev) {
+                const pw = prev.text.split(' ');
+                const cw = seg.text.split(' ');
+                let overlap = 0;
+                for (let n = Math.min(pw.length, cw.length); n >= 1; n--) {
+                    if (pw.slice(-n).join(' ') === cw.slice(0, n).join(' ')) { overlap = n; break; }
+                }
+                if (overlap >= Math.ceil(cw.length * 0.5)) {
+                    const added = cw.slice(overlap);
+                    if (added.length) {
+                        const endSec = seg.startSec != null ? seg.startSec + (seg.durSec ?? 0) : null;
+                        merged[merged.length - 1] = {
+                            ...prev,
+                            text: [...pw, ...added].join(' '),
+                            durSec: prev.startSec != null && endSec != null ? endSec - prev.startSec : prev.durSec,
+                        };
+                    }
+                    continue;
+                }
+            }
+            merged.push(seg);
+        }
+        const seen = new Set();
+        return merged.filter(s => s.text && !seen.has(s.text) && seen.add(s.text));
     }
-    return out;
+
+    const seen = new Set();
+    return segments.filter(s => s.text && !seen.has(s.text) && seen.add(s.text));
 }
 
-function buildTranscriptText(segments, joinWith = 'space') {
+// ─── Output Builders ─────────────────────────────────────────────────────────
+
+function secToSrtStamp(sec) {
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = Math.floor(sec % 60);
+    const ms = Math.round((sec % 1) * 1000);
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
+}
+
+function buildSrt(segments) {
+    return segments.map((seg, i) => {
+        const s = secToSrtStamp(seg.startSec ?? 0);
+        const e = secToSrtStamp((seg.startSec ?? 0) + (seg.durSec ?? 2));
+        return `${i + 1}\n${s} --> ${e}\n${seg.text}`;
+    }).join('\n\n');
+}
+
+function buildTranscriptText(segments, { joinWith = 'space', paragraphMode = false, paragraphBreakSecs = 1.5 }) {
+    if (!segments.length) return '';
+    if (paragraphMode) {
+        const paras = [];
+        let cur = [];
+        for (let i = 0; i < segments.length; i++) {
+            cur.push(segments[i].text);
+            const next = segments[i + 1];
+            const gap = next
+                ? (next.startSec ?? 0) - ((segments[i].startSec ?? 0) + (segments[i].durSec ?? 0))
+                : Infinity;
+            if (gap >= paragraphBreakSecs) { paras.push(cur.join(' ')); cur = []; }
+        }
+        if (cur.length) paras.push(cur.join(' '));
+        return paras.join('\n\n');
+    }
     const sep = joinWith === 'newline' ? '\n' : ' ';
-    return segments.map((s) => s.text).join(sep).replace(/\s+\n/g, '\n').trim();
+    return segments.map(s => s.text).join(sep).replace(/\s+\n/g, '\n').trim();
 }
 
-function normalizeBlockedReason(stderr = '') {
-    const s = stderr.toLowerCase();
+function computeStats(segments, transcriptText) {
+    const wordCount = transcriptText.split(/\s+/).filter(Boolean).length;
+    const last = segments[segments.length - 1];
+    const coveredSec = last ? (last.startSec ?? 0) + (last.durSec ?? 0) : 0;
+    return {
+        wordCount,
+        charCount: transcriptText.length,
+        segmentCount: segments.length,
+        coveredSec: Math.round(coveredSec),
+        wordsPerMinute: coveredSec > 0 ? Math.round((wordCount / coveredSec) * 60) : null,
+        estimatedReadingTimeSec: Math.round(wordCount / 3.33),
+    };
+}
+
+// ─── Error Classification ─────────────────────────────────────────────────────
+
+function normalizeBlockedReason(text = '') {
+    const s = text.toLowerCase();
     if (s.includes('429') || s.includes('too many requests')) return '429';
     if (s.includes('captcha')) return 'captcha';
-    if (s.includes('sign in to confirm') || s.includes('sign in')) return 'signin_required';
+    if (s.includes('sign in to confirm') || s.includes('login_required')) return 'signin_required';
     if (s.includes('consent') && s.includes('loop')) return 'consent_loop';
+    if (s.includes('private') || s.includes('unavailable')) return 'unavailable';
     return 'unknown';
 }
+
+// ─── Direct YouTube Strategy ──────────────────────────────────────────────────
+// Fetches the watch page, parses ytInitialPlayerResponse, pulls VTT directly.
+// No subprocess — ~5-10x faster than yt-dlp. Falls back to yt-dlp on failure.
+
+const BROWSER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cookie': 'CONSENT=YES+cb; SOCS=CAI',
+};
+
+async function httpGet(url, { proxyUrl, timeoutMs, extraHeaders = {} } = {}) {
+    const opts = {
+        headers: { ...BROWSER_HEADERS, ...extraHeaders },
+        signal: AbortSignal.timeout(Math.min(timeoutMs ?? 30000, 45000)),
+        redirect: 'follow',
+    };
+    if (proxyUrl) {
+        const { ProxyAgent } = await import('undici');
+        opts.dispatcher = new ProxyAgent(proxyUrl);
+    }
+    const res = await fetch(url, opts);
+    if (!res.ok) throw new Error(`HTTP_${res.status}`);
+    return res;
+}
+
+// Brace-counting extractor — handles any nesting depth, no regex fragility.
+function extractPlayerResponse(html) {
+    const key = 'ytInitialPlayerResponse';
+    const idx = html.indexOf(key);
+    if (idx === -1) throw new Error('NO_PLAYER_RESPONSE');
+
+    let i = idx + key.length;
+    while (i < html.length && (html[i] === ' ' || html[i] === '=')) i++;
+    if (html[i] !== '{') throw new Error('NO_PLAYER_RESPONSE');
+
+    let depth = 0, inStr = false, esc = false;
+    const start = i;
+    for (; i < html.length; i++) {
+        const c = html[i];
+        if (esc) { esc = false; continue; }
+        if (c === '\\' && inStr) { esc = true; continue; }
+        if (c === '"') { inStr = !inStr; continue; }
+        if (!inStr) {
+            if (c === '{') depth++;
+            else if (c === '}' && --depth === 0) return JSON.parse(html.slice(start, i + 1));
+        }
+    }
+    throw new Error('MALFORMED_PLAYER_RESPONSE');
+}
+
+// Score a track: exact lang match > prefix match; manual > auto-generated.
+function scoreTrack(track, languagePrefs) {
+    const code = track.languageCode ?? '';
+    const isAuto = track.kind === 'asr';
+    let langScore = 0;
+    for (let i = 0; i < languagePrefs.length; i++) {
+        if (code === languagePrefs[i]) { langScore = (100 - i) * 100; break; }
+        if (code.startsWith(languagePrefs[i])) { langScore = (50 - i) * 100; break; }
+    }
+    return langScore + (isAuto ? 0 : 50);
+}
+
+async function runDirectStrategy(videoId, { languagePrefs, proxyUrl, timeoutMs, removeBrackets, debug }) {
+    const t0 = Date.now();
+    const watchUrl = `https://www.youtube.com/watch?v=${videoId}&hl=en`;
+    if (debug) log.info(`[direct] fetching ${watchUrl}`);
+
+    const pageRes = await httpGet(watchUrl, { proxyUrl, timeoutMs });
+    const html = await pageRes.text();
+    const pr = extractPlayerResponse(html);
+
+    const status = pr?.playabilityStatus?.status;
+    if (status === 'LOGIN_REQUIRED') throw new Error('BLOCKED:signin_required');
+    if (status === 'ERROR' || status === 'UNPLAYABLE') throw new Error('NO_CAPTIONS');
+
+    const tracklist = pr?.captions?.playerCaptionsTracklistRenderer;
+    if (!tracklist?.captionTracks?.length) throw new Error('NO_CAPTIONS');
+
+    const tracks = tracklist.captionTracks;
+    const subLangs = languagePrefs.length ? languagePrefs : ['en'];
+
+    const availableLanguages = tracks.map(t => ({
+        code: t.languageCode,
+        name: t.name?.simpleText ?? t.languageCode,
+        isAutoGenerated: t.kind === 'asr',
+    }));
+
+    const best = [...tracks].sort((a, b) => scoreTrack(b, subLangs) - scoreTrack(a, subLangs))[0];
+    if (debug) log.info(`[direct] selected: ${best.languageCode} kind=${best.kind} (${tracks.length} tracks)`);
+
+    const vttRes = await httpGet(best.baseUrl + '&fmt=vtt', {
+        proxyUrl, timeoutMs, extraHeaders: { Referer: watchUrl },
+    });
+    const vttContent = await vttRes.text();
+
+    const vd = pr?.videoDetails ?? {};
+    const mf = pr?.microformat?.playerMicroformatRenderer ?? {};
+
+    return {
+        vttContent,
+        isAutoGenerated: best.kind === 'asr',
+        selectedLanguage: best.languageCode,
+        availableLanguages,
+        title: vd.title ?? mf.title?.simpleText ?? null,
+        channelName: vd.author ?? null,
+        durationSec: vd.lengthSeconds ? Number(vd.lengthSeconds) : null,
+        strategy: 'direct',
+        extractionMs: Date.now() - t0,
+        vttKvKey: null,
+        vttFilename: null,
+    };
+}
+
+// ─── yt-dlp Strategy ──────────────────────────────────────────────────────────
 
 function sanitizeProxyArg(arg) {
     return arg.replace(/(https?:\/\/)([^:@]+):([^@]+)@/i, '$1***:***@');
@@ -140,10 +329,8 @@ function sanitizeProxyArg(arg) {
 
 function sanitizeCommand(args) {
     const out = [...args];
-    const proxyIdx = out.findIndex((a) => a === '--proxy');
-    if (proxyIdx >= 0 && out[proxyIdx + 1]) {
-        out[proxyIdx + 1] = sanitizeProxyArg(out[proxyIdx + 1]);
-    }
+    const idx = out.findIndex(a => a === '--proxy');
+    if (idx >= 0 && out[idx + 1]) out[idx + 1] = sanitizeProxyArg(out[idx + 1]);
     return out;
 }
 
@@ -151,303 +338,279 @@ async function runYtDlp(args, { proxyUrl, timeoutMs, debug, proxyInjected }) {
     const finalArgs = [...args];
     if (proxyUrl) finalArgs.push('--proxy', proxyUrl);
     if (debug) {
-        const sanitized = sanitizeCommand(finalArgs);
-        log.info(`yt-dlp cmd: yt-dlp ${sanitized.join(' ')}`);
+        log.info(`yt-dlp cmd: yt-dlp ${sanitizeCommand(finalArgs).join(' ')}`);
         log.info(`proxyInjected=${proxyInjected}`);
     }
     try {
-        const { stdout, stderr } = await execFileAsync('yt-dlp', finalArgs, {
-            timeout: timeoutMs,
-            maxBuffer: 10 * 1024 * 1024,
-        });
-        return { stdout, stderr };
+        return await execFileAsync('yt-dlp', finalArgs, { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 });
     } catch (err) {
-        const stderr = err?.stderr || '';
-        if (debug && stderr) {
-            const lines = stderr.split(/\r?\n/).slice(0, 15).join('\n');
-            log.info(`yt-dlp stderr (first 15 lines):\n${lines}`);
+        if (debug && err?.stderr) {
+            log.info(`yt-dlp stderr:\n${String(err.stderr).split(/\r?\n/).slice(0, 15).join('\n')}`);
         }
         throw err;
     }
 }
 
-// Single yt-dlp call: downloads manual+auto subs and fetches metadata via --print.
-// Eliminates the separate --list-subs roundtrip and three individual metadata calls.
-async function downloadSubtitlesWithMeta({ url, outputTemplate, subLangs, proxyUrl, timeoutMs, debug, proxyInjected }) {
-    const args = [
-        '--write-sub',
-        '--write-auto-sub',
-        '--skip-download',
-        '--sub-format', 'vtt',
-        '--sub-langs', subLangs.join(','),
-        '--no-playlist',
-        '--print', '%(title)s|||%(uploader)s|||%(duration)s',
-        '--output', outputTemplate,
-        url,
-    ];
-    const { stdout, stderr } = await runYtDlp(args, { proxyUrl, timeoutMs, debug, proxyInjected });
+async function runYtDlpStrategy(videoId, { languagePrefs, proxyUrl, timeoutMs, debug, removeBrackets, saveVttToKV, cacheStore }) {
+    const t0 = Date.now();
+    const subLangs = languagePrefs.length ? languagePrefs : ['en'];
+    const watchUrl = makeWatchUrl(videoId);
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'yt-tx-'));
+    const outputTemplate = path.join(tempDir, 'transcript');
 
-    // yt-dlp writes info messages to stderr
-    const infoOutput = stderr || '';
-    let subtitleType = 'auto';
-    let source = 'yt-dlp-auto';
-    let isAutoGenerated = true;
-    if (infoOutput.includes('Writing video subtitles to:')) {
-        subtitleType = 'manual';
-        source = 'yt-dlp-manual';
-        isAutoGenerated = false;
-    }
+    try {
+        const { stdout, stderr } = await runYtDlp([
+            '--write-sub', '--write-auto-sub',
+            '--skip-download',
+            '--sub-format', 'vtt',
+            '--sub-langs', subLangs.join(','),
+            '--no-playlist',
+            '--print', '%(title)s|||%(uploader)s|||%(duration)s',
+            '--output', outputTemplate,
+            watchUrl,
+        ], { proxyUrl, timeoutMs, debug, proxyInjected: Boolean(proxyUrl) });
 
-    // Parse metadata from --print output (one line containing |||)
-    const printLine = (stdout || '').split(/\r?\n/).find((l) => l.includes('|||'));
-    let title = null;
-    let channelName = null;
-    let durationSec = null;
-    if (printLine) {
-        const [t, u, d] = printLine.split('|||');
-        title = t?.trim() || null;
-        channelName = u?.trim() || null;
-        const dRaw = d?.trim();
-        durationSec = dRaw ? Number(dRaw) : null;
-        if (Number.isNaN(durationSec)) durationSec = null;
-    }
+        const files = await fs.readdir(tempDir);
+        const vtts = files.filter(f => f.startsWith('transcript') && f.endsWith('.vtt'));
 
-    return { stdout, stderr, title, channelName, durationSec, subtitleType, source, isAutoGenerated };
-}
-
-async function findVttFile(dir, outputPrefix, preferredLangs = []) {
-    const files = await fs.readdir(dir);
-    const vtts = files.filter((f) => f.startsWith(outputPrefix) && f.endsWith('.vtt'));
-    if (!vtts.length) return null;
-    if (preferredLangs.length) {
-        for (const lang of preferredLangs) {
-            const match = vtts.find((f) => f.includes(`.${lang}.`));
-            if (match) return path.join(dir, match);
+        if (!vtts.length) {
+            const reason = normalizeBlockedReason(String(stderr ?? ''));
+            throw new Error(reason !== 'unknown' ? `BLOCKED:${reason}` : 'NO_TRANSCRIPT');
         }
+
+        let vttFile = vtts[0];
+        for (const lang of subLangs) {
+            const match = vtts.find(f => f.includes(`.${lang}.`));
+            if (match) { vttFile = match; break; }
+        }
+
+        const vttContent = await fs.readFile(path.join(tempDir, vttFile), 'utf-8');
+        const isAutoGenerated = !String(stderr ?? '').includes('Writing video subtitles to:');
+        const langFromFile = vttFile.replace(/\.vtt$/, '').split('.').pop() ?? null;
+
+        const printLine = String(stdout ?? '').split(/\r?\n/).find(l => l.includes('|||'));
+        let title = null, channelName = null, durationSec = null;
+        if (printLine) {
+            const [t, u, d] = printLine.split('|||');
+            title = t?.trim() || null;
+            channelName = u?.trim() || null;
+            const dn = Number(d?.trim());
+            durationSec = Number.isNaN(dn) || dn === 0 ? null : dn;
+        }
+
+        let vttKvKey = null, vttFilename = null;
+        if (saveVttToKV) {
+            vttKvKey = `vtt:${videoId}:${langFromFile ?? 'default'}`;
+            vttFilename = vttFile;
+            await cacheStore.setValue(vttKvKey, vttContent, { contentType: 'text/vtt' });
+        }
+
+        return {
+            vttContent,
+            isAutoGenerated,
+            selectedLanguage: langFromFile,
+            availableLanguages: null,
+            title,
+            channelName,
+            durationSec,
+            strategy: 'ytdlp',
+            extractionMs: Date.now() - t0,
+            vttKvKey,
+            vttFilename,
+        };
+    } finally {
+        await cleanTempDir(tempDir);
     }
-    return path.join(dir, vtts[0]);
 }
 
-async function loadVttAndParse(filePath, { removeBrackets }) {
-    const content = await fs.readFile(filePath, 'utf-8');
-    return parseVtt(content, { removeBrackets });
-}
+// ─── Infrastructure ───────────────────────────────────────────────────────────
 
 async function cleanTempDir(dir) {
     try {
         const files = await fs.readdir(dir);
-        await Promise.all(files.map((f) => fs.unlink(path.join(dir, f))));
+        await Promise.all(files.map(f => fs.unlink(path.join(dir, f)).catch(() => {})));
         await fs.rmdir(dir);
-    } catch (e) {
-        log.warning(`Could not clean temp dir ${dir}: ${e?.message}`);
-    }
+    } catch { /* best-effort */ }
 }
 
 async function getProxyUrl(mode) {
     if (mode === 'off') return null;
     try {
-        if (mode === 'residential') {
-            const cfg = await Actor.createProxyConfiguration({ groups: ['RESIDENTIAL'] });
-            return cfg?.newUrl();
-        }
-        // default datacenter or auto
-        const cfg = await Actor.createProxyConfiguration();
-        return cfg?.newUrl();
+        const cfg = mode === 'residential'
+            ? await Actor.createProxyConfiguration({ groups: ['RESIDENTIAL'] })
+            : await Actor.createProxyConfiguration();
+        return cfg?.newUrl() ?? null;
     } catch {
         return null;
     }
 }
 
+// Build ordered execution plan: { strat, pm } pairs.
+// 'auto' tries direct (no subprocess) first, then yt-dlp as fallback.
+function buildPlan(inputStrategy, proxyMode, hasProxyAuth) {
+    const proxyModes = proxyMode === 'off' ? ['off']
+        : proxyMode === 'datacenter' ? (hasProxyAuth ? ['datacenter', 'off'] : ['off'])
+        : proxyMode === 'residential' ? (hasProxyAuth ? ['residential', 'datacenter', 'off'] : ['off'])
+        : hasProxyAuth ? ['datacenter', 'residential', 'off'] : ['off']; // auto
+
+    const strategies = inputStrategy === 'direct' ? ['direct']
+        : inputStrategy === 'ytdlp' ? ['ytdlp']
+        : ['direct', 'ytdlp'];
+
+    const plan = [];
+    for (const strat of strategies) {
+        for (const pm of proxyModes) plan.push({ strat, pm });
+    }
+    return plan;
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
 await Actor.init();
 
-const input = (await Actor.getInput()) || {};
+const input = (await Actor.getInput()) ?? {};
 const {
     videoUrl,
     preferredLanguage,
     languagePreference,
+    strategy: inputStrategy = 'auto',
     outputMode = 'text_only',
+    outputFormat = 'text',
     removeBrackets = true,
     joinWith = 'space',
+    paragraphMode = false,
+    paragraphBreakSecs = 1.5,
     proxyMode = 'auto',
     timeoutMs: inputTimeoutMs,
     timeoutSecs,
     maxRetries = 2,
     saveVttToKV = false,
     enableWhisper = false,
+    includeStats = false,
     debug = false,
 } = input;
 
-const timeoutMs = inputTimeoutMs ?? (typeof timeoutSecs === 'number' ? timeoutSecs * 1000 : 180000);
+const timeoutMs = inputTimeoutMs ?? (typeof timeoutSecs === 'number' ? timeoutSecs * 1000 : 180_000);
 const languagePrefs = normalizePreferredLanguage(preferredLanguage ?? languagePreference);
-const whisperEnabled = Boolean(enableWhisper);
 
-const videoId = extractVideoId(videoUrl || '');
+const videoId = extractVideoId(videoUrl ?? '');
 if (!videoId) {
     await Actor.pushData({ status: 'INVALID_URL', videoUrl, reason: 'Invalid or unsupported YouTube URL' });
     await Actor.exit();
 }
 
-const canonicalUrl = canonicalWatchUrl(videoId);
+const watchUrl = makeWatchUrl(videoId);
 const cacheStore = await Actor.openKeyValueStore();
-const requestedLangKey = languagePrefs?.[0] || 'default';
+const requestedLangKey = languagePrefs[0] ?? 'default';
 const cacheKey = `yt:${videoId}:${requestedLangKey}`;
-const requestedLanguage = languagePrefs?.[0] || null;
+const requestedLanguage = languagePrefs[0] ?? null;
+
 const cached = await cacheStore.getValue(cacheKey);
 if (cached) {
     await Actor.pushData({ ...cached, cacheHit: true, cacheKey });
     await Actor.exit();
 }
 
-const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'yt-tx-'));
-const outputPrefix = 'transcript';
-const outputTemplate = path.join(tempDir, outputPrefix);
-
-const attempts = [];
-if (proxyMode === 'auto') attempts.push('datacenter', 'residential');
-else if (proxyMode === 'off') attempts.push('off');
-else attempts.push(proxyMode);
-const proxyAttempted = [];
-
 const hasProxyAuth = Boolean(process.env.APIFY_TOKEN || process.env.APIFY_PROXY_PASSWORD);
-if ((proxyMode === 'datacenter' || proxyMode === 'residential') && !hasProxyAuth) {
-    await Actor.pushData({
-        status: 'ERROR',
-        reason: 'Proxy mode requested but APIFY_TOKEN/APIFY_PROXY_PASSWORD not set',
-        videoUrl: canonicalUrl,
-        videoId,
-        requestedLanguage,
-        selectedLanguage: null,
-        languageFallback: false,
-        subtitleType: 'none',
-        source: 'none',
-        cacheHit: false,
-        cacheKey,
-        proxyAttempted: [],
-    });
-    await Actor.exit();
-}
-
-if (debug) {
-    log.info(`proxyMode=${proxyMode}`);
-    try {
-        const { stdout } = await runYtDlp(['--version'], { proxyUrl: null, timeoutMs, debug, proxyInjected: false });
-        log.info(`yt-dlp version: ${String(stdout || '').trim()}`);
-    } catch {
-        log.info('yt-dlp version: unknown');
-    }
-}
-
+const plan = buildPlan(inputStrategy, proxyMode, hasProxyAuth);
+const proxyAttempted = [];
 let lastError = null;
 let blockedReason = null;
-let title = null;
-let channelName = null;
-let usedLanguage = null;
-let isAutoGenerated = null;
 
-try {
-    for (const mode of attempts) {
-        const proxyUrl = await getProxyUrl(mode === 'datacenter' ? 'datacenter' : mode);
-        const proxyInjected = Boolean(proxyUrl) && mode !== 'off';
-        if (mode !== 'off') proxyAttempted.push(mode);
+if (debug) {
+    log.info(`plan: ${plan.map(p => `${p.strat}/${p.pm}`).join(' → ')}`);
+    try {
+        const { stdout } = await runYtDlp(['--version'], { proxyUrl: null, timeoutMs, debug: false, proxyInjected: false });
+        log.info(`yt-dlp version: ${String(stdout ?? '').trim()}`);
+    } catch { log.info('yt-dlp: not available'); }
+}
 
-        for (let attempt = 0; attempt < Math.max(1, maxRetries); attempt++) {
-            try {
-                await Actor.sleep(Math.floor(500 + Math.random() * 1000));
+planLoop: for (const { strat, pm } of plan) {
+    const proxyUrl = await getProxyUrl(pm);
+    if (pm !== 'off' && !proxyAttempted.includes(pm)) proxyAttempted.push(pm);
 
-                // Default to 'en' when no language preference given to avoid downloading all languages
-                const subLangs = languagePrefs.length ? languagePrefs : ['en'];
-                const dlResult = await downloadSubtitlesWithMeta({
-                    url: canonicalUrl,
-                    outputTemplate,
-                    subLangs,
-                    proxyUrl,
-                    timeoutMs,
-                    debug,
-                    proxyInjected,
-                });
+    for (let attempt = 0; attempt < Math.max(1, maxRetries); attempt++) {
+        try {
+            await Actor.sleep(Math.floor(300 + Math.random() * 700));
 
-                const vttPath = await findVttFile(tempDir, outputPrefix, subLangs);
-                if (!vttPath) {
-                    blockedReason = normalizeBlockedReason(dlResult.stderr || '');
-                    if (blockedReason !== 'unknown') throw new Error(`BLOCKED:${blockedReason}`);
-                    throw new Error('NO_TRANSCRIPT');
-                }
+            const result = strat === 'direct'
+                ? await runDirectStrategy(videoId, { languagePrefs, proxyUrl, timeoutMs, removeBrackets, debug })
+                : await runYtDlpStrategy(videoId, { languagePrefs, proxyUrl, timeoutMs, debug, removeBrackets, saveVttToKV, cacheStore });
 
-                const warnings = [];
-                if (whisperEnabled) warnings.push('Whisper fallback is disabled in this version.');
+            const { vttContent, isAutoGenerated, selectedLanguage, availableLanguages,
+                    title, channelName, durationSec, strategy, extractionMs } = result;
 
-                const fname = path.basename(vttPath);
-                const parts = fname.split('.');
-                if (parts.length >= 3) usedLanguage = parts[parts.length - 2];
-                if (languagePrefs.length && usedLanguage && !languagePrefs.includes(usedLanguage)) {
-                    warnings.push('Preferred language not found; using default track.');
-                }
-
-                const segments = dedupeSegments(await loadVttAndParse(vttPath, { removeBrackets }));
-                const transcriptText = buildTranscriptText(segments, joinWith);
-                if (!transcriptText) throw new Error('EMPTY_TRANSCRIPT');
-
-                title = dlResult.title;
-                channelName = dlResult.channelName;
-                const durationSec = dlResult.durationSec;
-                const { subtitleType, source } = dlResult;
-                isAutoGenerated = dlResult.isAutoGenerated;
-
-                const languageFallback = warnings.length > 0;
-                const output = {
-                    status: 'SUCCESS',
-                    videoUrl: canonicalUrl,
-                    videoId,
-                    transcriptText,
-                    requestedLanguage,
-                    selectedLanguage: usedLanguage || null,
-                    languageFallback,
-                    subtitleType,
-                    source,
-                    isAutoGenerated: !!isAutoGenerated,
-                    warnings,
-                    meta: {},
-                    cacheHit: false,
-                    cacheKey,
-                    proxyAttempted,
-                };
-
-                if (title) output.title = title;
-                if (channelName) output.channelName = channelName;
-                if (durationSec != null) output.durationSec = durationSec;
-                if (outputMode === 'text_and_segments') output.segments = segments;
-
-                if (saveVttToKV && vttPath) {
-                    const vttContent = await fs.readFile(vttPath, 'utf-8');
-                    const vttKvKey = `vtt:${videoId}:${usedLanguage || 'default'}`;
-                    await cacheStore.setValue(vttKvKey, vttContent, { contentType: 'text/vtt' });
-                    output.vttKvKey = vttKvKey;
-                    output.vttFilename = path.basename(vttPath);
-                }
-
-                await cacheStore.setValue(cacheKey, output);
-                if (usedLanguage && usedLanguage !== requestedLangKey) {
-                    await cacheStore.setValue(`yt:${videoId}:${usedLanguage}`, output);
-                }
-
-                await cleanTempDir(tempDir);
-                await Actor.pushData(output);
-                await Actor.exit();
-            } catch (err) {
-                const msg = err?.message || String(err);
-                if (msg.startsWith('BLOCKED:')) {
-                    blockedReason = msg.split(':')[1];
-                    lastError = msg;
-                    break; // switch proxy mode
-                }
-                lastError = msg;
-                if (attempt === Math.max(1, maxRetries) - 1) break;
+            const warnings = [];
+            if (enableWhisper) warnings.push('Whisper fallback is disabled in this version.');
+            if (languagePrefs.length && selectedLanguage && !languagePrefs.includes(selectedLanguage)) {
+                warnings.push(`Preferred language unavailable; using ${selectedLanguage}.`);
             }
+
+            const rawSegments = parseVtt(vttContent, { removeBrackets });
+            const segments = dedupeSegments(rawSegments, isAutoGenerated);
+            const transcriptText = buildTranscriptText(segments, { joinWith, paragraphMode, paragraphBreakSecs });
+            if (!transcriptText) throw new Error('EMPTY_TRANSCRIPT');
+
+            const output = {
+                status: 'SUCCESS',
+                videoUrl: watchUrl,
+                videoId,
+                transcriptText,
+                requestedLanguage,
+                selectedLanguage: selectedLanguage ?? null,
+                languageFallback: warnings.length > 0,
+                subtitleType: isAutoGenerated ? 'auto' : 'manual',
+                source: `${strategy}-${isAutoGenerated ? 'auto' : 'manual'}`,
+                isAutoGenerated: !!isAutoGenerated,
+                strategy,
+                extractionMs,
+                warnings,
+                cacheHit: false,
+                cacheKey,
+                proxyAttempted: [...proxyAttempted],
+            };
+
+            if (title) output.title = title;
+            if (channelName) output.channelName = channelName;
+            if (durationSec != null) output.durationSec = durationSec;
+            if (availableLanguages) output.availableLanguages = availableLanguages;
+            if (outputMode === 'text_and_segments') output.segments = segments;
+            if (outputFormat === 'srt') output.srtContent = buildSrt(segments);
+            if (includeStats) output.stats = computeStats(segments, transcriptText);
+            if (result.vttKvKey) { output.vttKvKey = result.vttKvKey; output.vttFilename = result.vttFilename; }
+
+            if (saveVttToKV && strat === 'direct' && !result.vttKvKey) {
+                const vttKey = `vtt:${videoId}:${selectedLanguage ?? 'default'}`;
+                await cacheStore.setValue(vttKey, vttContent, { contentType: 'text/vtt' });
+                output.vttKvKey = vttKey;
+            }
+
+            await cacheStore.setValue(cacheKey, output);
+            if (selectedLanguage && selectedLanguage !== requestedLangKey) {
+                await cacheStore.setValue(`yt:${videoId}:${selectedLanguage}`, output);
+            }
+
+            await Actor.pushData(output);
+            await Actor.exit();
+
+        } catch (err) {
+            const msg = String(err?.message ?? err);
+            if (debug) log.info(`[${strat}/${pm}/attempt ${attempt + 1}] ${msg}`);
+
+            if (msg.startsWith('BLOCKED:')) {
+                blockedReason = msg.split(':')[1];
+                lastError = msg;
+                break; // try next proxy mode
+            }
+            if (msg.startsWith('NO_CAPTIONS') || msg === 'NO_TRANSCRIPT') {
+                lastError = msg;
+                break planLoop; // no subtitles exist — retrying won't help
+            }
+            lastError = msg;
+            if (attempt >= Math.max(1, maxRetries) - 1) break;
         }
     }
 }
-
-await cleanTempDir(tempDir);
 
 const errorOutput = {
     status: blockedReason ? 'BLOCKED' : 'NO_TRANSCRIPT',
@@ -457,17 +620,15 @@ const errorOutput = {
     requestedLanguage,
     selectedLanguage: null,
     languageFallback: false,
-    videoUrl: canonicalUrl,
+    videoUrl: watchUrl,
     videoId,
     cacheHit: false,
     cacheKey,
     proxyAttempted,
     lastError,
 };
-if (lastError === 'EMPTY_TRANSCRIPT') errorOutput.reason = 'Transcript file was empty after parsing';
-if (blockedReason) errorOutput.blocked_reason = blockedReason;
-if (title) errorOutput.title = title;
-if (channelName) errorOutput.channelName = channelName;
+if (lastError === 'EMPTY_TRANSCRIPT') errorOutput.reason = 'Transcript found but empty after parsing';
+if (blockedReason) errorOutput.blockedReason = blockedReason;
 
 await Actor.pushData(errorOutput);
 await Actor.exit();
